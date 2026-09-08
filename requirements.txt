@@ -1,0 +1,6 @@
+dataretrieval
+geopandas
+pandas
+matplotlib
+scipy
+pyextremes
