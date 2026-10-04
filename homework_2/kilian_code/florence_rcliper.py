@@ -36,16 +36,16 @@ states = gpd.read_file(
     "C:/Users/Kilia/Desktop/EMES546/homework_2/cb_2018_us_state_20m.zip"
 )
 
-fig, ax = plt.subplots(figsize=(8, 6))
+fig, ax = plt.subplots(figsize=(8, 10))
 states.plot(ax=ax, color="lightgray", edgecolor="white")
 ax.plot(florence["tclon"], florence["tclat"], "-", color="gray", lw=1)
 sc = ax.scatter(
     florence["tclon"], florence["tclat"], c=florence["Vmax"], cmap="plasma", s=15
 )
-plt.colorbar(sc, label="USA_WIND (kt)")
-ax.set_xlim(-100, -60)  # states file includes Alaska/Hawaii, so zoom in
+plt.colorbar(sc, label="Wind Speed (kt)")
+ax.set_xlim(-100, -30)  # states file includes Alaska/Hawaii, so zoom in
 ax.set_ylim(10, 50)
-ax.set_title("Hurricane Florence (2018) IBTrACS track")
+ax.set_title("Hurricane Florence Track")
 plt.show()
 
 # That is the right track after looking at paths from news soureces online
@@ -128,6 +128,46 @@ plt.show()
 
 step = 29  # time step 30
 print(florence.loc[step, ["time", "tclon", "tclat", "Vmax"]])
+
+landfall_time = pd.Timestamp("2018-09-14 11:15", tz="UTC")   # Wrightsville Beach, NC
+hours_after = 12                                              # change this to move earlier/later
+target_time = landfall_time + pd.Timedelta(hours=hours_after)
+
+# row whose time is closest to the target
+step = (florence["time"] - target_time).abs().idxmin()
+
+# check what you picked before plotting
+print(f"Time step {step + 1} (index {step})")
+print(florence.loc[step, ["time", "tclon", "tclat", "Vmax"]])
+
+# mm accumulated during the step -> mm/hr
+rate_mmhr = rainfall_RCLIPER[:, :, step] / timestep[step]
+
+fig, ax = plt.subplots(figsize=(8, 6))
+states.plot(ax=ax, color="lightgray", edgecolor="white")
+
+cf = ax.contourf(lon, lat, rate_mmhr.T, levels=15, cmap="viridis", alpha=0.8)
+plt.colorbar(cf, label="Rainfall rate (mm/hr)")
+
+ax.plot(
+    florence.loc[step, "tclon"],
+    florence.loc[step, "tclat"],
+    "r*",
+    markersize=15,
+    label="Storm center",
+)
+
+# zoom on the eastern U.S. where the storm is now
+ax.set_xlim(-90, -65)
+ax.set_ylim(25, 42)
+ax.set_xlabel("Longitude")
+ax.set_ylabel("Latitude")
+ax.set_title(
+    f"R-CLIPER rainfall rate, {hours_after} h after landfall "
+    f"(time step {step + 1}, {florence.loc[step, 'time']:%Y-%m-%d %H:%M} UTC)"
+)
+ax.legend()
+plt.show()
 
 # It looks like it is still way out in the Atlantic at this point, so no land fall.
 # That is why the plot looks funny. I will include an image of Florence's track in my PDF.
