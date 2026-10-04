@@ -218,7 +218,6 @@ __marimo__/
 .streamlit/secrets.toml
 
 # Kilian Additions:
-
 IBTrACS.NA.list.v04r01.lines/
 s_18mr25
 *.docx

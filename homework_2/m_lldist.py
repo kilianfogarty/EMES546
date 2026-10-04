@@ -1,4 +1,5 @@
 """Spherical-earth distance between lon/lat points (Python port of m_lldist_L)."""
+
 import numpy as np
 
 EARTH_RADIUS_KM = 6378.137
@@ -32,11 +33,19 @@ def m_lldist_L(lon, lat):
     a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
     dist = EARTH_RADIUS_KM * 2 * np.arcsin(np.sqrt(np.minimum(1, a)))
 
-    dx = (EARTH_RADIUS_KM * 2
-          * np.arcsin(np.sqrt(np.maximum(0, np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2)))
-          * np.sign(dlon))
-    dy = (EARTH_RADIUS_KM * 2
-          * np.arcsin(np.sqrt(np.minimum(1, np.sin(dlat / 2) ** 2)))
-          * np.sign(dlat))
+    dx = (
+        EARTH_RADIUS_KM
+        * 2
+        * np.arcsin(
+            np.sqrt(np.maximum(0, np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2))
+        )
+        * np.sign(dlon)
+    )
+    dy = (
+        EARTH_RADIUS_KM
+        * 2
+        * np.arcsin(np.sqrt(np.minimum(1, np.sin(dlat / 2) ** 2)))
+        * np.sign(dlat)
+    )
 
     return {"dist": dist, "dx": dx, "dy": dy}
