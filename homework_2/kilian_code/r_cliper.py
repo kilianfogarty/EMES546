@@ -25,15 +25,24 @@ def R_CLIPER(longrid, latgrid, Vmax, tclat, tclon):
     # T0 = a1 + b1*U ; Tm = a2 + b2*U ; rm = a3 + b3*U ; re = a4 + b4*U
     # T0, Tm: inches/day ; rm, re: km
     # FILL IN THESE VALUES (left blank in the original R script too)
-    a1 = a2 = a3 = a4 = None
-    b1 = b2 = b3 = b4 = None
-    if None in (a1, a2, a3, a4, b1, b2, b3, b4):
-        raise NotImplementedError("Fill in the R-CLIPER coefficients a1..a4, b1..b4.")
+
+    # I PULLED THESE VALUES FROM THE IN CLASS HTML FROM LEC 8
+    # a is intercept, b is slope
+
+    a1 = -1.1
+    a2 = -1.6
+    a3 = 64.5
+    a4 = 150
+    b1 = 3.96
+    b2 = 4.8
+    b3 = -13
+    b4 = -16
 
     # ---- Normalized intensity ----
-    U = None  # FILL IN: normalized intensity as a function of Vmax
-    if U is None:
-        raise NotImplementedError("Fill in the equation for U.")
+
+    # idk if this should be int or float, I'm guessing float
+
+    U = 1 + (Vmax - 35) / 33
 
     # ---- R-CLIPER parameters ----
     T0 = a1 + b1 * U
