@@ -4,24 +4,15 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
+# This should be the path to your storm path shape file
 storms = gpd.read_file(
-    "/Users/Kilia/Desktop/EMES546/homework_1/provided_files/IBTrACS.NA.list.v04r01.lines/IBTrACS.NA.list.v04r01.lines.shp"
+    "/Users/Kilia/Desktop/EMES546/homework_1/IBTrACS.NA.list.v04r01.lines/IBTrACS.NA.list.v04r01.lines.shp"
 )
 
-# Read in U.S. states and filter to states with a coast line on the Gulf/Atlantic
-states = gpd.read_file(
-    "/Users/Kilia/Desktop/EMES546/homework_1/provided_files/s_18mr25/s_18mr25.shp"
-)
+# This should be the path to your states shape file
+states = gpd.read_file("/Users/Kilia/Desktop/EMES546/homework_1/s_18mr25/s_18mr25.shp")
 
-print("Storm CRS:")
-print(storms.crs)
-
-print("State CRS:")
-print(states.crs)
-
-print("Storm columns:")
-print(storms.columns)
-
+# switch states CRS to storm's version
 states_wgs84 = states.to_crs(storms.crs)
 
 coastal_states = [
@@ -47,7 +38,7 @@ coastal_states = [
 
 states_wgs84 = states_wgs84[states_wgs84["STATE"].isin(coastal_states)].copy()
 
-# I am using the hint to use "Landfall"
+# I am using the hint to use Landfall
 landfalls = storms[storms["USA_RECORD"] == "L"].copy()
 
 # Convert ISO_TIME to datetime
@@ -210,28 +201,19 @@ def return_period_data(annual_max):
 
     return sorted_max, return_period
 
+
 plt.figure(figsize=(10, 7))
 
 for i, annual_max in enumerate(realizations):
+    intensity, return_period = return_period_data(annual_max)
 
-    intensity, return_period = (
-        return_period_data(annual_max)
-    )
-
-    plt.plot(
-        intensity,
-        return_period,
-        label=f"Simulation {i + 1}"
-    )
+    plt.plot(intensity, return_period, label=f"Simulation {i + 1}")
 
 plt.yscale("log")
 
 plt.xlabel("Wind Speed (knots)")
 plt.ylabel("Return Period (years)")
-plt.title(
-    "Simulated Tropical Cyclone Wind Speed "
-    "Return Periods"
-)
+plt.title("Simulated Tropical Cyclone Wind Speed Return Periods")
 
 plt.legend()
 
