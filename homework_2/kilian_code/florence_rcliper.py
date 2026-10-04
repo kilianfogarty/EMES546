@@ -79,12 +79,11 @@ rainfall_RCLIPER = np.zeros((len(lon), len(lat), n))
 print(rainfall_RCLIPER.shape)
 
 for i in range(1, n):  # R's 2:nrow  ->  Python 1..n-1
-    # NOTE: the R script multiplies by 1.94384 (m/s -> knots). IBTrACS USA_WIND is
-    # already in knots, so check whether this conversion is really wanted.
+
     rgrid = R_CLIPER(
         longrid,
         latgrid,
-        Vmax=florence.loc[i, "Vmax"] * 1.94384,
+        Vmax=florence.loc[i, "Vmax"],
         tclat=florence.loc[i, "tclat"],
         tclon=florence.loc[i, "tclon"],
     )
