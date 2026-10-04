@@ -1,13 +1,14 @@
 """Hurricane Florence (2018) - R-CLIPER rainfall model (Python port of the main R script)."""
 
-import geopandas as gpd  # replaces sf::st_read
+import geopandas as gpd
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from m_lldist import m_lldist_L
 from r_cliper import R_CLIPER
 
 # ---- 1. Load IBTrACS North Atlantic data ----
-IBTRACS_PATH = "path/to/your/IBTrACS_file"  # <-- load your IBTrACS data here
+IBTRACS_PATH = "/Users/Kilia/Desktop/EMES546/homework_2/IBTrACS.NA.list.v04r01.lines/IBTrACS.NA.list.v04r01.lines.shp"
 ibtracs = gpd.read_file(IBTRACS_PATH)
 
 # ---- 2. Extract Hurricane Florence ----
@@ -28,6 +29,26 @@ florence = (
     .reset_index(drop=True)
 )
 n = len(florence)
+
+# Check states
+
+states = gpd.read_file(
+    "C:/Users/Kilia/Desktop/EMES546/homework_2/cb_2018_us_state_20m.zip"
+)
+
+fig, ax = plt.subplots(figsize=(8, 6))
+states.plot(ax=ax, color="lightgray", edgecolor="white")
+ax.plot(florence["tclon"], florence["tclat"], "-", color="gray", lw=1)
+sc = ax.scatter(
+    florence["tclon"], florence["tclat"], c=florence["Vmax"], cmap="plasma", s=15
+)
+plt.colorbar(sc, label="USA_WIND (kt)")
+ax.set_xlim(-100, -60)  # states file includes Alaska/Hawaii, so zoom in
+ax.set_ylim(10, 50)
+ax.set_title("Hurricane Florence (2018) IBTrACS track")
+plt.show()
+
+# That is the right track after looking at paths from news soureces online
 
 # ---- 3. Time step (hours between successive fixes; first is 0) ----
 timestep = np.zeros(n)

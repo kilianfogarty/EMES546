@@ -1,6 +1,7 @@
 dataretrieval
 geopandas
-pandas
 matplotlib
-scipy
+numpy
+pandas
 pyextremes
+scipy
