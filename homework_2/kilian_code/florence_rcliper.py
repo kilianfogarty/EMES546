@@ -67,8 +67,8 @@ else:
 
 # ---- 5. Rainfall model grid (0.5 degree) ----
 inc = 0.5
-lon = np.arange(-91, -68 + inc / 2, inc)  # inclusive of end, like R's seq()
-lat = np.arange(23, 43 + inc / 2, inc)
+lon = np.arange(-91, -25 + inc / 2, inc)  # inclusive of end, like R's seq()
+lat = np.arange(12, 43 + inc / 2, inc)
 
 # indexing="ij" -> arrays shaped (len(lon), len(lat)), matching R's lon x lat matrix
 longrid, latgrid = np.meshgrid(lon, lat, indexing="ij")
@@ -79,7 +79,6 @@ rainfall_RCLIPER = np.zeros((len(lon), len(lat), n))
 print(rainfall_RCLIPER.shape)
 
 for i in range(1, n):  # R's 2:nrow  ->  Python 1..n-1
-
     rgrid = R_CLIPER(
         longrid,
         latgrid,
@@ -129,8 +128,8 @@ plt.show()
 step = 29  # time step 30
 print(florence.loc[step, ["time", "tclon", "tclat", "Vmax"]])
 
-landfall_time = pd.Timestamp("2018-09-14 11:15", tz="UTC")   # Wrightsville Beach, NC
-hours_after = 12                                              # change this to move earlier/later
+landfall_time = pd.Timestamp("2018-09-14 11:15", tz="UTC")  # Wrightsville Beach, NC
+hours_after = 12  # change this to move earlier/later
 target_time = landfall_time + pd.Timedelta(hours=hours_after)
 
 # row whose time is closest to the target
@@ -158,8 +157,16 @@ ax.plot(
 )
 
 # zoom on the eastern U.S. where the storm is now
-ax.set_xlim(-90, -65)
-ax.set_ylim(25, 42)
+ax.set_xlim(
+    min(lon.min(), florence["tclon"].min()) - 5,
+    max(lon.max(), florence["tclon"].max()) + 15,  # <-- more room east
+)
+
+ax.set_ylim(
+    lat.min() - 5,
+    lat.max() + 5,
+)
+
 ax.set_xlabel("Longitude")
 ax.set_ylabel("Latitude")
 ax.set_title(
