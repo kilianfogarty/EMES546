@@ -1,0 +1,840 @@
+"""
+Hurricane Florence: how many buildings flood under present vs. warmer (PGW) climate?
+
+WHAT THIS SCRIPT DOES (read this first)
+---------------------------------------
+Inputs
+  - Two SFINCS flood model outputs (NetCDF): present climate and "PGW"
+    (pseudo-global-warming, ~4 C warmer). Both are on the SAME grid.
+  - A building footprint shapefile with a first-floor-elevation column "FFE".
+
+Steps
+  1. Load each SFINCS run -> ground elevation (zb), max water-surface
+     elevation (zs_max), and max flood depth (zs_max - zb).
+  2. Plot the flood depth maps (present, PGW, difference).
+  3. For every building, pull out the max depth and max water elevation
+     under its footprint.
+  4. Classify each building with TWO different definitions:
+       EXPOSED : water of at least FLOOD_THRESHOLD depth touches the footprint.
+       FLOODED : water surface rose ABOVE the building's first floor (FFE).
+     (Exposed is a loose definition; flooded is the strict one.
+      Every flooded building should also be exposed.)
+  5. Compare scenarios, print summary tables, map the changes.
+  6. Compare flood-depth distributions at buildings (histograms, mean/median).
+  7. Break the results down by occupancy category (residential, commercial, ...)
+     using the lookup tables, then save a GeoPackage and a summary CSV.
+
+KEY GOTCHA
+----------
+"FLOODED" compares water-surface ELEVATION to FFE, so FFE must be an
+elevation in the same vertical datum and units as the model (e.g. NAVD88 meters).
+If FFE is instead "height above ground", the comparison is meaningless.
+The datum check in step 7 prints numbers that tell you if this is the case.
+"""
+
+import warnings
+from pathlib import Path
+
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import netCDF4 as nc4
+import numpy as np
+import pandas as pd
+from rasterio.transform import from_bounds
+from rasterstats import zonal_stats
+from shapely.geometry import box
+
+# ==================================================
+# 1. SETTINGS
+# ==================================================
+
+DATA_DIR = Path("homework_3")
+PRESENT_FILE = DATA_DIR / "flor_ensmean_present_sfincs_map.nc"
+PGW_FILE = DATA_DIR / "flor_ensmean_future_sfincs_map.nc"
+BUILDINGS_FILE = DATA_DIR / "buildings_NH" / "buildings_NH.shp"
+OUTPUT_FILE = "florence_building_flooding_comparison.gpkg"
+
+MODEL_CRS = "EPSG:32617"  # UTM zone 17N, the SFINCS model's coordinate system
+# FFE column units -> meters. 1.0 if FFE is already in meters, 0.3048 if in feet.
+# This data is in FEET (a datum check with 1.0 gave median FFE - ground = 23.5 m).
+FFE_CONVERSION = 0.3048
+FLOOD_THRESHOLD = 0.15  # meters; shallower water is treated as "dry"
+
+
+# ==================================================
+# 2. LOAD A SFINCS RUN
+# ==================================================
+
+
+def to_north_up(a, nrows, ncols):
+    """
+    Return a 2D array with shape (nrows, ncols) and row 0 = northernmost row,
+    which is the orientation rasterio/rasterstats expect.
+    (NetCDF grids may be stored transposed and/or south-up.)
+    """
+    if a.shape == (ncols, nrows) and nrows != ncols:
+        a = a.T
+    assert a.shape == (nrows, ncols), f"Unexpected grid shape: {a.shape}"
+    return np.flipud(a)
+
+
+def load_sfincs(nc_file):
+    """
+    Read one SFINCS output file.
+
+    Returns
+      zb      : ground elevation (m), 2D north-up
+      zs_max  : max water-surface elevation (m), 2D north-up
+      depth   : max flood depth (m); NaN where depth < FLOOD_THRESHOLD
+      extent  : (xmin, xmax, ymin, ymax) of the model in MODEL_CRS
+    """
+    with nc4.Dataset(nc_file) as nc:
+
+        def read(name):
+            # Masked NetCDF array -> plain float array with NaN for missing
+            return np.ma.filled(nc.variables[name][:].astype("float64"), np.nan)
+
+        zb = read("zb")
+        corner_x = read("corner_x")
+        corner_y = read("corner_y")
+
+        # The water-surface variable is named differently across SFINCS versions
+        name = "zs_max" if "zs_max" in nc.variables else "zsmax"
+        zs_max = read(name)
+
+    nrows, ncols = zb.shape[-2:]
+    extent = (
+        np.nanmin(corner_x),
+        np.nanmax(corner_x),
+        np.nanmin(corner_y),
+        np.nanmax(corner_y),
+    )
+
+    zb = to_north_up(zb, nrows, ncols)
+
+    # zs_max may have an extra leading dimension (e.g. time/ensemble).
+    # Take the maximum over it so we end up with one 2D "peak water" map.
+    if zs_max.ndim == 3:
+        grid_dims = {(nrows, ncols), (ncols, nrows)}
+        if zs_max.shape[1:] in grid_dims:
+            extra_axis = 0
+        elif zs_max.shape[:2] in grid_dims:
+            extra_axis = 2
+        else:
+            raise ValueError(f"Unexpected zs_max shape: {zs_max.shape}")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)  # all-NaN slices
+            zs_max = np.nanmax(zs_max, axis=extra_axis)
+    zs_max = to_north_up(zs_max, nrows, ncols)
+
+    # Flood depth = water surface minus ground. Anything shallower than the
+    # threshold is set to NaN, so NaN means "dry".
+    depth_raw = zs_max - zb
+    depth = np.where(depth_raw >= FLOOD_THRESHOLD, depth_raw, np.nan)
+
+    print(
+        f"{Path(nc_file).name}: grid {depth.shape}, max depth {np.nanmax(depth):.2f} m"
+    )
+    return zb, zs_max, depth, extent
+
+
+zb, present_zs, present_depth, extent = load_sfincs(PRESENT_FILE)
+zb_pgw, pgw_zs, pgw_depth, extent_pgw = load_sfincs(PGW_FILE)
+
+# The comparison only makes sense if both runs share the same grid
+assert present_depth.shape == pgw_depth.shape
+assert np.allclose(extent, extent_pgw)
+
+xmin, xmax, ymin, ymax = extent
+nrows, ncols = present_depth.shape
+
+
+# ==================================================
+# 3. MAP FLOOD DEPTHS
+# ==================================================
+
+depth_change = pgw_depth - present_depth  # NaN wherever either run is dry
+vmax = np.nanmax([np.nanmax(present_depth), np.nanmax(pgw_depth)])
+true_max_change = np.nanmax(np.abs(depth_change))
+
+# Color scale for the change panel: use the 99th percentile of |change| instead of the
+# absolute max. A few extreme cells would otherwise stretch the scale so far that
+# the typical changes all look pale. Cells beyond this limit are drawn in the darkest
+# color (not removed), and the colorbar ends get arrows to show that clipping happens.
+diff_limit = np.nanpercentile(np.abs(depth_change), 99)
+print(
+    f"Depth-change map: color scale is +/-{diff_limit:.2f} m "
+    f"(true max |change| is {true_max_change:.2f} m)"
+)
+
+fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+im1 = axes[0].imshow(present_depth, extent=extent, cmap="Blues", vmin=0, vmax=vmax)
+axes[0].set_title("Present-Day Climate")
+axes[1].imshow(pgw_depth, extent=extent, cmap="Blues", vmin=0, vmax=vmax)
+axes[1].set_title("4°C Warmer Climate (PGW)")
+im3 = axes[2].imshow(
+    depth_change, extent=extent, cmap="RdBu_r", vmin=-diff_limit, vmax=diff_limit
+)
+axes[2].set_title("Change in Flood Depth (PGW - Present)")
+
+for ax in axes:
+    ax.set_xlabel("Easting (m)")
+    ax.set_ylabel("Northing (m)")
+fig.colorbar(im1, ax=axes[:2], label="Maximum Flood Depth (m)", shrink=0.85, pad=0.04)
+fig.colorbar(
+    im3,
+    ax=axes[2],
+    label=f"Change in Depth (m)\n(saturates beyond ±{diff_limit:.2f}; true max {true_max_change:.2f})",
+    shrink=0.85,
+    pad=0.04,
+    extend="both",  # arrows on the ends: values beyond the limits are clipped to that color
+)
+fig.suptitle("Hurricane Florence: Present vs. 4°C Warmer Climate", fontsize=15)
+plt.show()
+
+
+# ==================================================
+# 4. LOAD BUILDINGS
+# ==================================================
+
+buildings = gpd.read_file(BUILDINGS_FILE).to_crs(MODEL_CRS)
+
+# Keep only buildings that overlap the model domain
+model_box = box(xmin, ymin, xmax, ymax)
+buildings = buildings[buildings.intersects(model_box)].reset_index(drop=True)
+print("Buildings in study area:", len(buildings))
+if len(buildings) == 0:
+    raise ValueError("No buildings intersect the SFINCS model extent.")
+
+
+# ==================================================
+# 5. RASTER -> BUILDING VALUES
+# ==================================================
+
+# Affine transform: maps (col, row) pixel indices <-> (x, y) map coordinates
+transform = from_bounds(xmin, ymin, xmax, ymax, ncols, nrows)
+
+
+def sample_at_points(raster, xs, ys):
+    """Read raster values at point coordinates (NaN if outside the grid)."""
+    cols, rows = ~transform * (xs, ys)  # map coords -> fractional pixel coords
+    cols, rows = np.floor(cols).astype(int), np.floor(rows).astype(int)
+    inside = (rows >= 0) & (rows < nrows) & (cols >= 0) & (cols < ncols)
+    out = np.full(len(xs), np.nan)
+    out[inside] = raster[rows[inside], cols[inside]]
+    return out
+
+
+def building_stat(raster, stat):
+    """
+    For each building, compute `stat` ("max" or "mean") of the raster cells
+    whose CENTER falls inside the footprint. NaN cells are ignored.
+
+    Small buildings can fall between cell centers and get no value;
+    for those we just read the raster at a point inside the footprint.
+    """
+    results = zonal_stats(
+        buildings,
+        raster,
+        affine=transform,
+        stats=[stat],
+        nodata=np.nan,
+        all_touched=False,
+    )
+    vals = np.array([r[stat] if r[stat] is not None else np.nan for r in results])
+
+    missing = np.isnan(vals)
+    if missing.any():
+        pts = buildings.geometry[missing].representative_point()
+        vals[missing] = sample_at_points(raster, pts.x.values, pts.y.values)
+    return vals
+
+
+# ==================================================
+# 6. CLASSIFY BUILDINGS
+# ==================================================
+
+# Wet-only water-surface elevation: NaN wherever the cell is dry.
+# This is the fix that makes FLOODED a subset of EXPOSED. The raw zs_max equals
+# the ground elevation in dry cells, so using it directly would flag buildings
+# on high ground as "flooded" without any water being nearby.
+present_zs_wet = np.where(np.isnan(present_depth), np.nan, present_zs)
+pgw_zs_wet = np.where(np.isnan(pgw_depth), np.nan, pgw_zs)
+
+buildings["present_depth"] = building_stat(present_depth, "max")
+buildings["pgw_depth"] = building_stat(pgw_depth, "max")
+buildings["present_zs"] = building_stat(present_zs_wet, "max")
+buildings["pgw_zs"] = building_stat(pgw_zs_wet, "max")
+buildings["ground_m"] = building_stat(zb, "mean")  # only used for the datum check
+
+buildings["FFE_m"] = buildings["FFE"] * FFE_CONVERSION
+has_ffe = buildings["FFE_m"].notna()
+
+# EXPOSED: any wet cell (depth >= threshold) under the footprint.
+# NaN depth means dry, and NaN >= x is False, so this works directly.
+buildings["present_exposed"] = buildings["present_depth"] >= FLOOD_THRESHOLD
+buildings["pgw_exposed"] = buildings["pgw_depth"] >= FLOOD_THRESHOLD
+
+# FLOODED: wet cell whose water surface reaches the first floor.
+# Buildings with no FFE can't be classified, so they are kept False here and
+# reported separately as "no FFE" below.
+buildings["present_flooded"] = has_ffe & (buildings["present_zs"] >= buildings["FFE_m"])
+buildings["pgw_flooded"] = has_ffe & (buildings["pgw_zs"] >= buildings["FFE_m"])
+
+
+# ==================================================
+# 7. SANITY CHECKS (look at these before trusting results!)
+# ==================================================
+
+print("\n=== DATUM CHECK: FFE vs. ground elevation ===")
+offset = (buildings["FFE_m"] - buildings["ground_m"]).dropna()
+print(f"Buildings with FFE: {has_ffe.sum()} of {len(buildings)}")
+print(
+    f"Median (FFE - ground): {offset.median():.2f} m  "
+    "(expect a small positive number, roughly 0.2-1 m)"
+)
+print(f"Buildings with FFE BELOW ground: {(offset < 0).sum()}")
+# A median ratio near 3.28 means FFE is in feet but FFE_CONVERSION is set to 1.0.
+ratio = (buildings["FFE_m"] / buildings["ground_m"]).replace([np.inf, -np.inf], np.nan)
+print(f"Median (FFE / ground): {ratio.median():.2f}  (about 3.28 => unit mix-up)")
+print(
+    "If the median is near 0.5 m and ground is several meters above sea level,\n"
+    "FFE is probably height-above-ground, not an elevation -> add ground_m to it."
+)
+
+n_bad = int((buildings["present_flooded"] & ~buildings["present_exposed"]).sum())
+print(f"\nFlooded-but-not-exposed (should be 0): {n_bad}")
+
+
+# ==================================================
+# 8. SUMMARY
+# ==================================================
+
+n = len(buildings)
+n_exp_present = int(buildings["present_exposed"].sum())
+n_exp_pgw = int(buildings["pgw_exposed"].sum())
+n_fl_present = int(buildings["present_flooded"].sum())
+n_fl_pgw = int(buildings["pgw_flooded"].sum())
+
+print("\n=== EXPOSED (water >= threshold touches footprint) ===")
+print(
+    f"Present: {n_exp_present}   PGW: {n_exp_pgw}   Change: {n_exp_pgw - n_exp_present}"
+)
+
+print("\n=== FLOODED (water surface >= first-floor elevation) ===")
+print(f"Present: {n_fl_present} ({n_fl_present / n:.1%} of all buildings)")
+print(f"PGW:     {n_fl_pgw} ({n_fl_pgw / n:.1%} of all buildings)")
+print(f"Change:  {n_fl_pgw - n_fl_present}")
+if n_fl_present > 0:
+    print(f"Percent change: {(n_fl_pgw - n_fl_present) / n_fl_present:.1%}")
+
+print(f"\nBuildings missing FFE: {int((~has_ffe).sum())}")
+
+
+# ==================================================
+# 9. WHAT CHANGED PER BUILDING
+# ==================================================
+
+# Four-way label for every building with a known FFE
+buildings["flooding_change"] = "Unknown (no FFE)"
+was, now = buildings["present_flooded"], buildings["pgw_flooded"]
+buildings.loc[has_ffe & ~was & ~now, "flooding_change"] = "Unflooded in both"
+buildings.loc[has_ffe & ~was & now, "flooding_change"] = "Newly flooded"
+buildings.loc[has_ffe & was & ~now, "flooding_change"] = "No longer flooded"
+buildings.loc[has_ffe & was & now, "flooding_change"] = "Flooded in both"
+
+print("\n=== CHANGE IN BUILDING FLOODING ===")
+print(buildings["flooding_change"].value_counts())
+
+# RECONCILIATION CHECK: the change categories must add up to the flooded totals.
+#   flooded in PRESENT = flooded in both + no longer flooded
+#   flooded in PGW     = flooded in both + newly flooded
+# If this fails, the numbers above came from different versions of the data
+# (e.g. a stale variable from an earlier run), so rerun the whole script from the top.
+_c = buildings["flooding_change"].value_counts()
+_both = int(_c.get("Flooded in both", 0))
+_new = int(_c.get("Newly flooded", 0))
+_lost = int(_c.get("No longer flooded", 0))
+print("\nReconciliation:")
+print(
+    f"  Present flooded {n_fl_present} = both {_both} + no longer {_lost} = {_both + _lost}"
+)
+print(f"  PGW flooded     {n_fl_pgw} = both {_both} + newly {_new} = {_both + _new}")
+if n_fl_present != _both + _lost or n_fl_pgw != _both + _new:
+    raise AssertionError(
+        "Flooded counts do not reconcile; see the lines printed above."
+    )
+
+colors = {
+    "Newly flooded": "red",
+    "No longer flooded": "blue",
+    "Flooded in both": "purple",
+    "Unflooded in both": "lightgray",
+    "Unknown (no FFE)": "orange",
+}
+
+fig, ax = plt.subplots(figsize=(12, 9))
+
+# Plot each building as ONE POINT (its centroid) instead of its full footprint.
+# At this map scale footprints are too small to show their color, and drawing
+# 100k+ polygons is slow. Points are visible and fast.
+# (Buildings are in UTM meters, so centroids are accurate.)
+centroids = buildings.geometry.centroid
+cx, cy = centroids.x.values, centroids.y.values
+
+# Draw the boring categories first so the interesting ones end up on top
+draw_order = [
+    "Unflooded in both",
+    "Unknown (no FFE)",
+    "Flooded in both",
+    "No longer flooded",
+    "Newly flooded",
+]
+for z, category in enumerate(draw_order):
+    mask = (buildings["flooding_change"] == category).values
+    if mask.any():
+        ax.scatter(
+            cx[mask],
+            cy[mask],
+            s=3,
+            color=colors[category],
+            label=f"{category} ({mask.sum()})",
+            zorder=z,
+        )
+ax.set_aspect("equal")  # keep x and y to the same scale, like a real map
+ax.set_title("Changes in Building Flooding: Present vs. PGW", fontsize=14)
+ax.set_xlabel("Easting (m)")
+ax.set_ylabel("Northing (m)")
+ax.legend(title="Flooding Status")
+plt.tight_layout()
+plt.show()
+
+
+# ==================================================
+# 10. FLOOD-DEPTH DISTRIBUTIONS AT BUILDINGS
+# ==================================================
+#
+# HOW "FLOOD DEPTH AT A BUILDING" IS ESTIMATED (this choice affects every number below)
+#
+#   PRIMARY  = MAX depth over the footprint (computed in section 6).
+#              Depth is measured in meters above the ground, taken from the wet
+#              grid cells (depth >= FLOOD_THRESHOLD) whose center falls inside the
+#              footprint. Buildings with no wet cell are dry (NaN) and are left OUT
+#              of every histogram and statistic. So "mean/median depth" here means
+#              "among EXPOSED buildings".
+#              Effect: max gives the deepest water touching the building, so it is the
+#              highest of the plausible estimates and larger buildings get higher values.
+#
+#   CHECK    = depth sampled at the building CENTROID (one grid cell per building).
+#              Effect: lower and noisier than max; a centroid can be dry while the
+#              footprint edge is wet, so fewer buildings count as exposed.
+#
+# If the conclusions are the same under both, they don't depend on this choice.
+
+BIN_WIDTH = 0.25  # meters; identical for both scenarios so histograms are comparable
+
+cent = buildings.geometry.centroid
+buildings["present_depth_centroid"] = sample_at_points(
+    present_depth, cent.x.values, cent.y.values
+)
+buildings["pgw_depth_centroid"] = sample_at_points(
+    pgw_depth, cent.x.values, cent.y.values
+)
+
+# (label, present column, PGW column)
+depth_methods = [
+    ("max over footprint (PRIMARY)", "present_depth", "pgw_depth"),
+    ("centroid cell (check)", "present_depth_centroid", "pgw_depth_centroid"),
+]
+
+print("\n=== FLOOD DEPTH AT EXPOSED BUILDINGS (meters above ground) ===")
+for label, col_present, col_pgw in depth_methods:
+    p = buildings[col_present].dropna()
+    g = buildings[col_pgw].dropna()
+    print(f"\nDepth estimate: {label}")
+    print(f"  Present: n={len(p):6d}  mean={p.mean():.3f}  median={p.median():.3f}")
+    print(f"  PGW:     n={len(g):6d}  mean={g.mean():.3f}  median={g.median():.3f}")
+    print(
+        f"  Change:  n={len(g) - len(p):+6d}  mean={g.mean() - p.mean():+.3f}  "
+        f"median={g.median() - p.median():+.3f}"
+    )
+
+# ---- Histograms (primary estimate) ----
+present_vals = buildings["present_depth"].dropna()
+pgw_vals = buildings["pgw_depth"].dropna()
+
+# Same bin edges for both scenarios, covering the deepest value in either
+top = np.ceil(max(present_vals.max(), pgw_vals.max()) / BIN_WIDTH) * BIN_WIDTH
+bins = np.arange(0, top + BIN_WIDTH, BIN_WIDTH)
+
+# sharex/sharey => all panels use identical axes, so bar heights are directly comparable
+fig, axes = plt.subplots(1, 3, figsize=(18, 5), sharex=True, sharey=True)
+
+for ax, vals, title, color in [
+    (axes[0], present_vals, "Present", "tab:blue"),
+    (axes[1], pgw_vals, "PGW (4°C warmer)", "tab:red"),
+]:
+    ax.hist(vals, bins=bins, color=color, edgecolor="white")
+    ax.axvline(vals.mean(), color="k", ls="--", label=f"mean = {vals.mean():.2f} m")
+    ax.axvline(
+        vals.median(), color="k", ls=":", label=f"median = {vals.median():.2f} m"
+    )
+    ax.set_title(f"{title} (n = {len(vals)} exposed buildings)")
+    ax.legend()
+
+# Third panel: both outlines on the same axes for direct comparison
+axes[2].hist(
+    present_vals, bins=bins, histtype="step", lw=2, color="tab:blue", label="Present"
+)
+axes[2].hist(pgw_vals, bins=bins, histtype="step", lw=2, color="tab:red", label="PGW")
+axes[2].set_title("Overlay")
+axes[2].legend()
+
+for ax in axes:
+    ax.set_xlabel("Max flood depth within building footprint (m)")
+axes[0].set_ylabel("Number of buildings")
+fig.suptitle(f"Flood depth at exposed buildings (bin width {BIN_WIDTH} m)", fontsize=14)
+plt.tight_layout()
+plt.show()
+
+# ---- Is it MORE buildings, DEEPER water, or both? ----
+# The mean of the whole distribution mixes two effects, so separate them:
+#   (1) buildings newly reaching the exposure threshold (usually shallow water)
+#   (2) buildings already exposed in the present, now with deeper water
+# Newly exposed buildings tend to be shallow, which can pull the overall mean DOWN even
+# when water at already-exposed buildings gets deeper. Comparing the same buildings
+# in both scenarios avoids that.
+exposed_both = buildings["present_exposed"] & buildings["pgw_exposed"]
+newly_exposed = ~buildings["present_exposed"] & buildings["pgw_exposed"]
+no_longer_exposed = buildings["present_exposed"] & ~buildings["pgw_exposed"]
+
+paired_change = (buildings["pgw_depth"] - buildings["present_depth"])[exposed_both]
+
+print("\n=== MORE BUILDINGS OR DEEPER WATER? ===")
+print(f"Exposed in present:                {int(buildings['present_exposed'].sum())}")
+print(f"Newly exposed under PGW:           {int(newly_exposed.sum())}")
+print(f"No longer exposed under PGW:       {int(no_longer_exposed.sum())}")
+print(f"Exposed in both:                   {int(exposed_both.sum())}")
+print("\nBuildings exposed in BOTH scenarios (same buildings, paired):")
+print(
+    f"  Present depth:  mean={buildings.loc[exposed_both, 'present_depth'].mean():.3f}  "
+    f"median={buildings.loc[exposed_both, 'present_depth'].median():.3f}"
+)
+print(
+    f"  PGW depth:      mean={buildings.loc[exposed_both, 'pgw_depth'].mean():.3f}  "
+    f"median={buildings.loc[exposed_both, 'pgw_depth'].median():.3f}"
+)
+print(
+    f"  Depth change:   mean={paired_change.mean():+.3f}  median={paired_change.median():+.3f}  "
+    f"({(paired_change > 0).mean():.1%} of these buildings got deeper)"
+)
+print("\nNewly exposed buildings (PGW depth):")
+print(
+    f"  mean={buildings.loc[newly_exposed, 'pgw_depth'].mean():.3f}  "
+    f"median={buildings.loc[newly_exposed, 'pgw_depth'].median():.3f}"
+)
+
+
+# ==================================================
+# 11. FLOOD EXPOSURE BY BUILDING (OCCUPANCY) TYPE
+# ==================================================
+#
+# WHAT THIS SECTION DOES
+#   1. Reads each building's occupancy CODE (e.g. 1245) and decodes it with
+#      OCCUP_LOOKUP.csv into an occupancy TYPE (e.g. RES1 = single-family home).
+#   2. Groups the ~60 occupancy types into 6 categories (see occupancy_to_category).
+#   3. Builds a table per category: how many buildings are exposed / flooded in each
+#      scenario, the change, the share of the category affected, and flood depths.
+#   4. Plots flooded counts, shares, and depth distributions by category.
+#
+# HOW THE CATEGORIES ARE DEFINED (judgment calls are listed so you can change them)
+#   Agriculture            AGR*
+#   Commercial             COMM*   (includes hospitals COMM6 and clinics COMM7,
+#                                   because the lookup table lists them as commercial)
+#   Government/Education   GOV*, EDU*   (GOV2 = emergency response: police, fire, EOC)
+#   Industry               IND*    (includes IND6 construction)
+#   Residential            RES*    (includes hotels RES4, dormitories/jails RES5 and
+#                                   nursing homes RES6, since the lookup lists them as RES)
+#   Other                  everything else: utilities (power, water, gas, oil,
+#                          wastewater), religion/non-profit (REL*), NOT_PROVIDED,
+#                          and any code that is not found in the lookup table.
+#
+# WHICH COLUMN HOLDS THE OCCUPANCY CODE?
+#   The shapefile's column name isn't known in advance, so the script checks every
+#   column and picks the one whose values best match the lookup codes (preferring a
+#   name containing "OCC"). It prints its choice. If it picks wrong, set OCC_COLUMN
+#   below to the right column name, e.g. OCC_COLUMN = "OCC".
+#
+# NOTE ON DENOMINATORS
+#   "Exposed" shares use ALL buildings in a category.
+#   "Flooded" shares use only buildings WITH a first-floor elevation (FFE), because
+#   a building with no FFE can't be classified. The "no_ffe" column shows how many
+#   are missing; if it is large for a category, treat that category's flooded
+#   numbers with caution.
+
+OCCUP_LOOKUP_FILE = DATA_DIR / "OCCUP_LOOKUP.csv"  # copy the lookup CSVs into DATA_DIR
+OCC_COLUMN = None  # None = auto-detect; or set the shapefile column name yourself
+MIN_N_BOX = 5  # skip a boxplot if a category has fewer exposed buildings than this
+
+CATEGORY_ORDER = [
+    "Agriculture",
+    "Commercial",
+    "Government/Education",
+    "Industry",
+    "Residential",
+    "Other",
+]
+
+
+def occupancy_to_category(occ_type):
+    """Map an occupancy type like 'RES1' or 'COMM4' to one of the six categories."""
+    if not isinstance(occ_type, str):  # code not found in the lookup
+        return "Other"
+    t = occ_type.upper()
+    if t.startswith("AGR"):
+        return "Agriculture"
+    if t.startswith("COMM"):
+        return "Commercial"
+    if t.startswith(("GOV", "EDU")):
+        return "Government/Education"
+    if t.startswith("IND"):
+        return "Industry"
+    if t.startswith("RES"):
+        return "Residential"
+    return "Other"
+
+
+def clean_code(series):
+    """Make codes comparable: text, trimmed, upper case, no trailing '.0' (1245.0 -> 1245)."""
+    return (
+        series.astype(str).str.strip().str.upper().str.replace(r"\.0$", "", regex=True)
+    )
+
+
+# Lookup: code -> occupancy type (every code appears exactly once in the table)
+occ_lookup = pd.read_csv(OCCUP_LOOKUP_FILE, dtype=str)
+code_to_type = dict(
+    zip(
+        occ_lookup["Code"].str.strip().str.upper(),
+        occ_lookup["Type"].str.strip().str.upper(),
+    )
+)
+
+
+def find_occupancy_column(gdf):
+    """Return the column whose values best match the occupancy lookup codes."""
+    if OCC_COLUMN is not None:
+        return OCC_COLUMN
+
+    known = set(code_to_type)
+    scores = {}
+    for col in gdf.columns:
+        if col == "geometry":
+            continue
+        vals = gdf[col].dropna()
+        if len(vals) == 0:
+            continue
+        scores[col] = clean_code(vals).isin(known).mean()  # share of values that match
+
+    ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+    print("\nOccupancy column candidates (share of values found in lookup):")
+    for col, s in ranked[:5]:
+        print(f"  {col:20s} {s:.1%}")
+
+    # Prefer a column named like "OCC..." if it matches well; otherwise the best match
+    named = [c for c, s in ranked if "OCC" in str(c).upper() and s > 0.5]
+    if named:
+        return named[0]
+    if ranked and ranked[0][1] > 0.5:
+        return ranked[0][0]
+    raise ValueError(
+        "Could not find the occupancy column automatically. "
+        f"Columns are: {list(gdf.columns)}. Set OCC_COLUMN at the top of section 11."
+    )
+
+
+occ_col = find_occupancy_column(buildings)
+print(f"Using occupancy column: '{occ_col}'")
+
+buildings["occ_type"] = clean_code(buildings[occ_col]).map(code_to_type)  # e.g. 'RES1'
+buildings["occ_category"] = buildings["occ_type"].map(occupancy_to_category)
+print(
+    f"Buildings whose code is not in the lookup (put in 'Other'): "
+    f"{int(buildings['occ_type'].isna().sum())}"
+)
+
+# SANITY CHECK: the lookup tables for occupancy, building material and foundation share
+# some numeric codes, so a wrong column can partly match. If the most common types below
+# look implausible (a town should be mostly RES1, then COMM*), set OCC_COLUMN by hand.
+print("Most common occupancy types found:")
+print(buildings["occ_type"].value_counts().head(8).to_string())
+
+
+def summarize(b):
+    """One row of results for a group of buildings `b`."""
+    with_ffe = b["FFE_m"].notna()
+    depth_present = b["present_depth"].dropna()  # exposed buildings only (dry = NaN)
+    depth_pgw = b["pgw_depth"].dropna()
+
+    # Same buildings exposed in both scenarios: did their water get deeper?
+    exposed_both = b["present_exposed"] & b["pgw_exposed"]
+    paired_change = (b["pgw_depth"] - b["present_depth"])[exposed_both]
+
+    flooded_present = int(b["present_flooded"].sum())
+    flooded_pgw = int(b["pgw_flooded"].sum())
+    n_ffe = int(with_ffe.sum())
+
+    return {
+        "n_buildings": len(b),
+        "no_ffe": int((~with_ffe).sum()),
+        "exposed_present": int(b["present_exposed"].sum()),
+        "exposed_pgw": int(b["pgw_exposed"].sum()),
+        "flooded_present": flooded_present,
+        "flooded_pgw": flooded_pgw,
+        "flooded_change": flooded_pgw - flooded_present,
+        # % change is undefined when nothing flooded in the present
+        "flooded_pct_change": (
+            (flooded_pgw - flooded_present) / flooded_present * 100
+            if flooded_present > 0
+            else np.nan
+        ),
+        "newly_flooded": int((b["flooding_change"] == "Newly flooded").sum()),
+        "no_longer_flooded": int((b["flooding_change"] == "No longer flooded").sum()),
+        "pct_exposed_present": b["present_exposed"].mean() * 100 if len(b) else np.nan,
+        "pct_exposed_pgw": b["pgw_exposed"].mean() * 100 if len(b) else np.nan,
+        "pct_flooded_present": flooded_present / n_ffe * 100 if n_ffe else np.nan,
+        "pct_flooded_pgw": flooded_pgw / n_ffe * 100 if n_ffe else np.nan,
+        "depth_mean_present": depth_present.mean(),
+        "depth_median_present": depth_present.median(),
+        "depth_mean_pgw": depth_pgw.mean(),
+        "depth_median_pgw": depth_pgw.median(),
+        "paired_depth_change_median": paired_change.median(),  # same buildings, both runs
+    }
+
+
+rows = {
+    cat: summarize(buildings[buildings["occ_category"] == cat])
+    for cat in CATEGORY_ORDER
+    if (buildings["occ_category"] == cat).any()
+}
+rows["All"] = summarize(buildings)
+by_category = pd.DataFrame(rows).T  # one row per category
+
+# RECONCILIATION CHECK for every row: present flooded + newly flooded - no longer flooded
+# must equal PGW flooded. (The 'All' row must also equal the totals from section 8.)
+_gap = (
+    by_category["flooded_present"]
+    + by_category["newly_flooded"]
+    - by_category["no_longer_flooded"]
+    - by_category["flooded_pgw"]
+)
+if (_gap != 0).any():
+    raise AssertionError(
+        f"By-category flooded counts do not reconcile:\n{_gap[_gap != 0]}"
+    )
+assert by_category.loc["All", "flooded_pgw"] == n_fl_pgw, (
+    "All-row PGW total != section 8 total"
+)
+
+print("\n=== FLOOD EXPOSURE BY OCCUPANCY CATEGORY ===")
+print("(depth = max over footprint, m, exposed buildings only; pct_* are percentages)")
+with pd.option_context("display.width", 250, "display.max_columns", None):
+    print(by_category.round(2).to_string())
+
+by_category.round(3).to_csv("florence_flooding_by_category.csv")
+
+# ---- Figure A: how many flooded, and what share of each category ----
+cats = [c for c in by_category.index if c != "All"]
+x = np.arange(len(cats))
+w = 0.38
+
+fig, axes = plt.subplots(1, 2, figsize=(15, 5))
+axes[0].bar(
+    x - w / 2,
+    by_category.loc[cats, "flooded_present"].astype(float),
+    w,
+    label="Present",
+    color="tab:blue",
+)
+axes[0].bar(
+    x + w / 2,
+    by_category.loc[cats, "flooded_pgw"].astype(float),
+    w,
+    label="PGW",
+    color="tab:red",
+)
+axes[0].set_ylabel("Number of flooded buildings")
+axes[0].set_title("Flooded buildings (water above first floor)")
+
+axes[1].bar(
+    x - w / 2,
+    by_category.loc[cats, "pct_flooded_present"].astype(float),
+    w,
+    label="Present",
+    color="tab:blue",
+)
+axes[1].bar(
+    x + w / 2,
+    by_category.loc[cats, "pct_flooded_pgw"].astype(float),
+    w,
+    label="PGW",
+    color="tab:red",
+)
+axes[1].set_ylabel("% of category flooded")
+axes[1].set_title("Share of each category flooded (buildings with known FFE)")
+
+for ax in axes:
+    ax.set_xticks(x)
+    ax.set_xticklabels(cats, rotation=20, ha="right")
+    ax.legend()
+fig.suptitle("Flooding by occupancy category", fontsize=14)
+plt.tight_layout()
+plt.show()
+
+# ---- Figure B: depth distribution at exposed buildings, per category ----
+from matplotlib.patches import Patch
+
+fig, ax = plt.subplots(figsize=(13, 6))
+tick_pos, tick_labels = [], []
+for i, cat in enumerate(cats):
+    b = buildings[buildings["occ_category"] == cat]
+    d_present, d_pgw = b["present_depth"].dropna(), b["pgw_depth"].dropna()
+    pos = i * 3  # each category gets a pair of boxes with a gap before the next
+    for vals, offset, color in [(d_present, 0, "tab:blue"), (d_pgw, 1, "tab:red")]:
+        if len(vals) >= MIN_N_BOX:  # tiny samples make misleading boxes
+            bp = ax.boxplot(
+                vals,
+                positions=[pos + offset],
+                widths=0.8,
+                patch_artist=True,
+                showfliers=False,
+                medianprops=dict(color="black"),
+            )
+            bp["boxes"][0].set_facecolor(color)
+    tick_pos.append(pos + 0.5)
+    tick_labels.append(f"{cat}\nn = {len(d_present)} / {len(d_pgw)}")
+
+ax.set_xticks(tick_pos)
+ax.set_xticklabels(tick_labels)
+ax.set_ylabel("Max flood depth within footprint (m)")
+ax.set_title(
+    "Flood depth at exposed buildings by category\n"
+    "(box = middle 50%, line = median, whiskers exclude outliers; "
+    "n = exposed buildings, present / PGW)"
+)
+ax.legend(
+    handles=[
+        Patch(color="tab:blue", label="Present"),
+        Patch(color="tab:red", label="PGW"),
+    ]
+)
+plt.tight_layout()
+plt.show()
+
+
+# ==================================================
+# 12. SAVE
+# ==================================================
+
+buildings.to_file(OUTPUT_FILE, driver="GPKG")
+print("\nSaved:", OUTPUT_FILE)

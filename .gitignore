@@ -221,3 +221,15 @@ __marimo__/
 IBTrACS.NA.list.v04r01.lines/
 s_18mr25
 *.docx
+*.csv
+*.cpg
+*.dbf
+*.prj
+*.shp
+*.shx
+*.gpkg
+LOOKUP_TABLES/
+buildings_NH/
+flor_ensmean_future_sfincs_map.nc
+flor_ensmean_present_sfincs_map.nc
+sfincs_map.nc
